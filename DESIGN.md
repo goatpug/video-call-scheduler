@@ -230,6 +230,13 @@ Optimized for a small trusted group and minimal friction:
 | `POST /bookings`               | Book a one-off call (date + time)                                        |
 | `POST /bookings/<id>/cancel`   | Cancel my one-off                                                        |
 
+Members also see the join outcome of their own recent occurrences ("agent
+joined 14:01 ✓" / "join failed ✗") on `/my-schedule`. In the reference
+household today, a failed join means a WhatsApp message to the admin; showing
+the agent's telemetry to the member closes that loop — the member can see
+immediately whether the machine-side join ran before assuming the recipient
+isn't coming.
+
 Booking rules (service layer, all unit-tested):
 
 - Start times snap to `time_step_minutes` and must fall inside the
@@ -378,14 +385,38 @@ The joiner is a small strategy interface with two implementations:
 **`keystroke` (default — the proven technique).**
 
 1. Kill any prior Chrome the agent launched.
-2. Launch Chrome via `subprocess` on the Meet URL, `--start-fullscreen`,
-   using the default (signed-in) profile.
+2. Launch Chrome via `subprocess` on the Meet URL, using the default
+   (signed-in) profile, with `--start-fullscreen --no-first-run
+   --no-default-browser-check --disable-session-crashed-bubble` — the last
+   three suppress Chrome's own nag dialogs ("restore pages?", "make Chrome
+   default?") that could otherwise sit between the user and the Enter key.
 3. Wait `page_load_wait_seconds` for the pre-join screen to render.
-4. Focus the Chrome window (pywinauto) and press **Enter** — Meet's pre-join
-   screen focuses "Join now"/"Ask to join" by default, which is exactly what
-   the household's current automation tool exploits.
-5. Report `join_succeeded` (best-effort: the keystroke strategy can't verify
-   in-call state, so this event means "sequence completed without error").
+4. Focus the Chrome window (pywinauto) — explicitly, immediately before the
+   keystroke — and press **Enter**. Meet's pre-join screen focuses
+   "Join now"/"Ask to join" by default, which is exactly what the
+   household's current automation tool exploits.
+5. Verify Chrome is still the foreground window after the keystroke; if
+   something stole focus (see below), re-focus and press Enter once more.
+6. Report `join_succeeded` (v0.1 decision: this means "sequence completed
+   without error" — the keystroke strategy can't verify in-call state; the
+   Playwright strategy is the upgrade path when stronger confirmation is
+   wanted).
+
+**Defending against stray popups.** The dominant real-world failure of the
+current tool is a popup — typically Microsoft Edge or a Windows nag —
+appearing over Chrome and swallowing the blind Enter keystroke, at which
+point the admin gets a "make it work" message. Three layers of defense:
+
+- The joiner never sends a blind keystroke: it focuses Chrome first and
+  verifies focus afterwards (steps 4–5), so a popup costs a retry, not the
+  call.
+- `docs/kiosk-setup.md` gets a dedicated "silence the machine" section:
+  disable Edge auto-start and its "recommended browser settings" prompts,
+  turn off Windows tips/notifications and Focus Assist interruptions, and
+  disable OneDrive/update reboots during calling hours.
+- If a join still fails, telemetry says so (`join_failed` with the name of
+  the foreground window that stole focus, when detectable) — visible to
+  admin and member, so diagnosis doesn't start from a WhatsApp message.
 
 **`playwright` (optional, more observable).** Drives Chrome via CDP with a
 persistent profile: waits for the actual pre-join DOM, verifies mic/camera
@@ -468,7 +499,9 @@ the suite passes on Linux CI, with the thin Windows layer exercised by a
 - **Agent `sync`:** server down → cache used; malformed response → cache
   kept; atomic cache write.
 - **Joiner:** strategies behind an interface; unit tests mock pywinauto/
-  subprocess and assert the sequence (kill → launch → wait → focus → Enter).
+  subprocess and assert the sequence (kill → launch → wait → focus → Enter →
+  verify focus), including the stolen-focus path (verify fails → exactly one
+  refocus/retry → `join_failed` with foreground-window detail).
   `kiosk-agent join --occurrence <id>` exists for manual smoke tests on the
   real laptop; the actual keystroke landing in the real Meet UI is verified
   manually, not in CI.
@@ -512,17 +545,21 @@ that code stays isolated from the scheduling core from day one.
 
 ---
 
-## 13. Open questions (decide before implementation)
+## 13. Decisions log & open questions
 
-1. **`min_gap_minutes` default** — 60 assumes at most one call per day per
-   sibling-cluster; with weekly cadence gaps rarely bind. Right default, or
-   larger (e.g. 120) to be safe out of the box?
-2. **Member visibility** — members see who holds each slot. Any preference
+Resolved:
+
+- **`min_gap_minutes` defaults to 60.** With weekly cadence the gap rarely
+  binds; households can raise it.
+- **Keystroke telemetry semantics accepted for v0.1**: `join_succeeded`
+  means "join sequence completed without error", not verified in-call
+  presence. The Playwright strategy remains the opt-in upgrade for stronger
+  confirmation.
+- **Static Meet URL reuse accepted for v0.1** (family-trust model, matches
+  current practice); v0.4's Calendar integration replaces it with per-call
+  links.
+
+Open:
+
+1. **Member visibility** — members see who holds each slot. Any preference
    for anonymized "taken"? Could be a setting later.
-3. **Keystroke `join_succeeded` semantics** — the default strategy can't
-   verify in-call state, only that the sequence ran. Is "sequence completed"
-   good enough for v0.1 telemetry, or should the Playwright strategy be the
-   default where installed?
-4. **Static Meet URL reuse** — a member's link is the same every call.
-   Acceptable for v0.1 (family-trust model, matches current practice);
-   v0.4's Calendar integration replaces it with per-call links.
