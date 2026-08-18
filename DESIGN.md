@@ -5,8 +5,9 @@
 A self-hosted Python web app that lets a small, trusted group (e.g. a family)
 schedule Google Meet video calls with a person who cannot operate a computer
 themselves (e.g. an elderly parent). A companion **kiosk agent** runs on the
-recipient's **Windows** laptop and automatically opens Chrome and joins the
-meeting at the scheduled time.
+recipient's **Windows** laptop and automatically opens the browser (Microsoft
+Edge by default; any Chromium-based browser works) and joins the meeting at
+the scheduled time.
 
 Throughout this document the person being called is the **recipient**, the
 people booking calls are **members**, and the person who runs the deployment is
@@ -16,12 +17,13 @@ the **admin**. The software is generic: nothing in the code should assume
 ### The system this replaces
 
 The reference household today uses closed-source automation software on the
-recipient's laptop that, at scheduled times, opens Chrome, navigates to a
-Meet link, and presses **Enter** (which activates Meet's "Join now" button).
+recipient's laptop that, at scheduled times, opens Microsoft Edge, navigates
+to a Meet link, and presses **Enter** (which activates Meet's "Join now"
+button).
 It works reliably, but only the admin can set schedules (via remote desktop),
 and the tool can't be integrated with. This project replaces both halves:
 members set their own schedules through the web app, and the agent replicates
-the proven open-Chrome-and-press-Enter join technique.
+the proven open-the-browser-and-press-Enter join technique.
 
 Two facts about real usage carried into the design:
 
@@ -75,7 +77,7 @@ Two deployable components sharing one repository:
 │   server / cheap VPS)  │  poll   │  Task Scheduler tick (per minute) │
 │                        │         │   ├─ sync schedule → local cache  │
 │  Flask + SQLite        │         │   └─ launch decision              │
-│  - admin UI            │         │  joiner: open Chrome on Meet URL, │
+│  - admin UI            │         │  joiner: open Edge on Meet URL,   │
 │  - member booking UI   │         │  wait for page, press Enter       │
 │  - JSON API for agent  │         │  (pluggable strategies)           │
 └────────────────────────┘         └───────────────────────────────────┘
@@ -105,7 +107,7 @@ recipient's machine, which keeps home-network setup trivial.
 | ORM / DB       | SQLAlchemy + SQLite             | Zero-ops self-hosting; SQLAlchemy leaves room for Postgres later.     |
 | Migrations     | Alembic                         | Schema will evolve release to release.                                |
 | Templates      | Jinja2 + a classless CSS sheet  | No JS build step; accessibility-friendly.                             |
-| Agent joiner   | `subprocess` (Chrome) + pywinauto for focus + Enter keystroke | Replicates the proven join technique; Playwright DOM automation as an optional second strategy. |
+| Agent joiner   | `subprocess` (Edge or any Chromium browser) + pywinauto for focus + Enter keystroke | Replicates the proven join technique; Playwright DOM automation as an optional second strategy. |
 | Scheduling     | Windows Task Scheduler (`schtasks`) | The Windows counterpart of cron; survives reboots; installable from the CLI. |
 | Tests          | pytest + coverage               | Requirement: features land with unit tests.                           |
 | Lint/format    | ruff (lint + format)            | One fast tool.                                                        |
@@ -320,7 +322,9 @@ non-technical admins never touch Python). Configured by a single file,
 server_url          = "https://calls.example.com"
 api_token           = "…"
 join_strategy       = "keystroke"        # or "playwright"
-chrome_path         = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+browser_path        = 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+                                         # any Chromium-based browser; Edge is
+                                         # the reference default, Chrome works too
 join_early_seconds  = 60                 # open the call this early
 late_join_minutes   = 30                 # still join if we wake up this late
 page_load_wait_seconds = 20              # keystroke strategy: wait before Enter
@@ -335,17 +339,20 @@ which shells out to `schtasks` to create a per-minute task running
 `pythonw -m kiosk_agent tick` (the `pythonw` entry point keeps console
 windows from flashing on the recipient's screen every minute). The task runs
 in the interactive session, because the keystroke strategy needs a visible,
-focusable Chrome window.
+focusable browser window.
 
 Setup docs (`docs/kiosk-setup.md`) cover the machine prerequisites — all of
 which the current closed-source setup already implies:
 
 - Windows auto-login enabled; screen lock and sleep disabled (screen *off*
   is fine; the session must stay unlocked).
-- Chrome's default profile signed into the recipient's Google account, with
-  camera + microphone permission granted for `meet.google.com` (visit any
-  Meet once during setup and allow them — the grant persists).
-- Chrome set as default or referenced by explicit `chrome_path`.
+- The browser's default profile signed into the recipient's Google account,
+  with camera + microphone permission granted for `meet.google.com` (visit
+  any Meet once during setup and allow them — the grant persists). Signing
+  into a Google account from Edge works fine and is what the reference
+  household does.
+- `browser_path` pointing at the browser executable (Edge's default install
+  path is pre-filled in the sample config).
 
 ### `tick` algorithm
 
@@ -361,14 +368,14 @@ ticks can't double-launch.
    - `LAUNCH(occurrence)` — an occurrence satisfies
      `start_at − join_early ≤ now < start_at + late_join` and it hasn't been
      launched yet (the lockfile records the last-launched `occurrence_id`).
-     Launching first kills any Chrome left over from a previous call.
+     Launching first kills any browser left over from a previous call.
    - `NONE` — otherwise.
 3. **Act:** spawn the joiner; post telemetry (best-effort).
 
 There is deliberately no `STOP` action: calls have no end time. The member
 leaves, Meet times out the recipient, and the leftover browser window sits
 harmlessly until the next call's launch cleans it up. (An optional
-`cleanup_after_hours` config can close Chrome some hours after a launch, for
+`cleanup_after_hours` config can close the browser some hours after a launch, for
 households that prefer a tidy screen — off by default.)
 
 Keeping `decide` pure (inputs: clock, occurrence list, lockfile state) makes
@@ -384,18 +391,20 @@ The joiner is a small strategy interface with two implementations:
 
 **`keystroke` (default — the proven technique).**
 
-1. Kill any prior Chrome the agent launched.
-2. Launch Chrome via `subprocess` on the Meet URL, using the default
-   (signed-in) profile, with `--start-fullscreen --no-first-run
-   --no-default-browser-check --disable-session-crashed-bubble` — the last
-   three suppress Chrome's own nag dialogs ("restore pages?", "make Chrome
-   default?") that could otherwise sit between the user and the Enter key.
+1. Kill any prior browser instance the agent launched.
+2. Launch the configured browser (`browser_path`, Edge by default) via
+   `subprocess` on the Meet URL, using the default (signed-in) profile, with
+   `--start-fullscreen --no-first-run --no-default-browser-check
+   --disable-session-crashed-bubble`. Edge is Chromium-based, so these flags
+   work identically in Edge and Chrome; they suppress the browser's own nag
+   dialogs ("restore pages?", first-run welcome) that could otherwise sit
+   between the user and the Enter key.
 3. Wait `page_load_wait_seconds` for the pre-join screen to render.
-4. Focus the Chrome window (pywinauto) — explicitly, immediately before the
+4. Focus the browser window (pywinauto) — explicitly, immediately before the
    keystroke — and press **Enter**. Meet's pre-join screen focuses
    "Join now"/"Ask to join" by default, which is exactly what the
    household's current automation tool exploits.
-5. Verify Chrome is still the foreground window after the keystroke; if
+5. Verify the browser is still the foreground window after the keystroke; if
    something stole focus (see below), re-focus and press Enter once more.
 6. Report `join_succeeded` (v0.1 decision: this means "sequence completed
    without error" — the keystroke strategy can't verify in-call state; the
@@ -403,22 +412,28 @@ The joiner is a small strategy interface with two implementations:
    wanted).
 
 **Defending against stray popups.** The dominant real-world failure of the
-current tool is a popup — typically Microsoft Edge or a Windows nag —
-appearing over Chrome and swallowing the blind Enter keystroke, at which
-point the admin gets a "make it work" message. Three layers of defense:
+current tool is a popup — typically one of Edge's own nags (sync/sign-in
+prompts, Copilot promos, "restore pages?", first-run "browser essentials"
+tours) or a Windows notification — appearing over or inside the call window
+and swallowing the blind Enter keystroke, at which point the admin gets a
+"make it work" message. Three layers of defense:
 
-- The joiner never sends a blind keystroke: it focuses Chrome first and
+- The joiner never sends a blind keystroke: it focuses the browser first and
   verifies focus afterwards (steps 4–5), so a popup costs a retry, not the
-  call.
+  call. The launch flags in step 2 pre-empt the restore-pages and first-run
+  classes of nag entirely.
 - `docs/kiosk-setup.md` gets a dedicated "silence the machine" section:
-  disable Edge auto-start and its "recommended browser settings" prompts,
-  turn off Windows tips/notifications and Focus Assist interruptions, and
-  disable OneDrive/update reboots during calling hours.
+  turn off Edge's promotional surfaces (sync nudges, Copilot, sidebar,
+  "recommended settings" prompts — via `edge://settings` and, where needed,
+  the documented Edge group-policy registry keys), turn off Windows
+  tips/notifications and Focus Assist interruptions, and disable
+  OneDrive/update reboots during calling hours.
 - If a join still fails, telemetry says so (`join_failed` with the name of
   the foreground window that stole focus, when detectable) — visible to
   admin and member, so diagnosis doesn't start from a WhatsApp message.
 
-**`playwright` (optional, more observable).** Drives Chrome via CDP with a
+**`playwright` (optional, more observable).** Drives the same browser via
+CDP (Playwright's `msedge` channel for Edge, `chrome` for Chrome) with a
 persistent profile: waits for the actual pre-join DOM, verifies mic/camera
 toggles, clicks the join button, and can confirm in-call state before
 reporting `join_succeeded`. More robust feedback, but sensitive to Google's
@@ -432,7 +447,7 @@ Reality checks encoded in the design:
   meeting first** to admit the recipient; `join_early_seconds` defaults to
   60 so the recipient is already knocking when the member arrives. Docs
   recommend members open their own link a couple of minutes early.
-- If the join sequence fails partway, the agent leaves Chrome open on
+- If the join sequence fails partway, the agent leaves the browser open on
   whatever screen it reached — the right Meet page at worst needs the
   member to admit her — and reports `join_failed` so the admin sees it.
 
@@ -447,7 +462,7 @@ video-call-scheduler/
 ├── README.md                 # quickstart for both components
 ├── docs/
 │   ├── server-setup.md
-│   └── kiosk-setup.md        # Windows prep: auto-login, no sleep, Chrome profile, install-task
+│   └── kiosk-setup.md        # Windows prep: auto-login, no sleep, Edge profile, install-task
 ├── src/
 │   ├── scheduler/            # web app package
 │   │   ├── app.py            # Flask app factory
@@ -462,7 +477,7 @@ video-call-scheduler/
 │       ├── sync.py           # HTTP client + cache
 │       ├── decide.py         # the pure decision function
 │       ├── joiner/
-│       │   ├── runner.py     # process management, lockfile, Chrome kill/launch
+│       │   ├── runner.py     # process management, lockfile, browser kill/launch
 │       │   ├── keystroke.py  # default strategy (pywinauto + Enter)
 │       │   ├── playwright_.py# optional strategy
 │       │   └── selectors.py
